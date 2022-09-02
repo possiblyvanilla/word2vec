@@ -1,0 +1,78 @@
+Flat profile:
+
+Each sample counts as 0.01 seconds.
+  %   cumulative   self              self     total           
+ time   seconds   seconds    calls   s/call   s/call  name    
+ 98.95    122.37   122.37        1   122.37   122.73  TrainModelThread
+  0.59    123.10     0.73 34010414     0.00     0.00  ReadWord
+  0.23    123.39     0.29        1     0.29     0.29  InitUnigramTable
+  0.14    123.56     0.17        1     0.17     0.54  LearnVocabFromTrainFile
+  0.06    123.64     0.08                             _init
+  0.01    123.65     0.01        1     0.01     0.01  CreateBinaryTree
+  0.01    123.66     0.01        1     0.01     0.01  InitNet
+  0.01    123.67     0.01        1     0.01   123.59  TrainModel
+  0.00    123.67     0.00   253855     0.00     0.00  AddWordToVocab
+  0.00    123.67     0.00       17     0.00     0.00  ArgPos
+  0.00    123.67     0.00        1     0.00     0.00  SortVocab
+
+			Call graph
+
+
+granularity: each sample hit covers 4 byte(s) for 0.01% of 123.67 seconds
+
+index % time    self  children    called     name
+                0.01  123.58       1/1           main [2]
+[1]     99.9    0.01  123.58       1         TrainModel [1]
+              122.37    0.36       1/1           TrainModelThread [3]
+                0.17    0.36       1/1           LearnVocabFromTrainFile [5]
+                0.29    0.00       1/1           InitUnigramTable [6]
+                0.01    0.00       1/1           CreateBinaryTree [8]
+                0.01    0.00       1/1           InitNet [9]
+-----------------------------------------------
+                                                 <spontaneous>
+[2]     99.9    0.00  123.59                 main [2]
+                0.01  123.58       1/1           TrainModel [1]
+                0.00    0.00      17/17          ArgPos [11]
+-----------------------------------------------
+              122.37    0.36       1/1           TrainModel [1]
+[3]     99.2  122.37    0.36       1         TrainModelThread [3]
+                0.36    0.00 17005207/34010414     ReadWord [4]
+-----------------------------------------------
+                0.36    0.00 17005207/34010414     LearnVocabFromTrainFile [5]
+                0.36    0.00 17005207/34010414     TrainModelThread [3]
+[4]      0.6    0.73    0.00 34010414         ReadWord [4]
+-----------------------------------------------
+                0.17    0.36       1/1           TrainModel [1]
+[5]      0.4    0.17    0.36       1         LearnVocabFromTrainFile [5]
+                0.36    0.00 17005207/34010414     ReadWord [4]
+                0.00    0.00  253855/253855      AddWordToVocab [10]
+                0.00    0.00       1/1           SortVocab [12]
+-----------------------------------------------
+                0.29    0.00       1/1           TrainModel [1]
+[6]      0.2    0.29    0.00       1         InitUnigramTable [6]
+-----------------------------------------------
+                                                 <spontaneous>
+[7]      0.1    0.08    0.00                 _init [7]
+-----------------------------------------------
+                0.01    0.00       1/1           TrainModel [1]
+[8]      0.0    0.01    0.00       1         CreateBinaryTree [8]
+-----------------------------------------------
+                0.01    0.00       1/1           TrainModel [1]
+[9]      0.0    0.01    0.00       1         InitNet [9]
+-----------------------------------------------
+                0.00    0.00  253855/253855      LearnVocabFromTrainFile [5]
+[10]     0.0    0.00    0.00  253855         AddWordToVocab [10]
+-----------------------------------------------
+                0.00    0.00      17/17          main [2]
+[11]     0.0    0.00    0.00      17         ArgPos [11]
+-----------------------------------------------
+                0.00    0.00       1/1           LearnVocabFromTrainFile [5]
+[12]     0.0    0.00    0.00       1         SortVocab [12]
+-----------------------------------------------
+
+Index by function name
+
+  [10] AddWordToVocab          [6] InitUnigramTable        [1] TrainModel
+  [11] ArgPos                  [5] LearnVocabFromTrainFile [3] TrainModelThread
+   [8] CreateBinaryTree        [4] ReadWord                [7] _init
+   [9] InitNet                [12] SortVocab

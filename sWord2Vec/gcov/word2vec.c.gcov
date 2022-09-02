@@ -1,0 +1,1369 @@
+        -:    0:Source:word2vec.c
+        -:    0:Graph:word2vec.gcno
+        -:    0:Data:word2vec.gcda
+        -:    0:Runs:1
+        -:    1://  Copyright 2013 Google Inc. All Rights Reserved.
+        -:    2://
+        -:    3://  Licensed under the Apache License, Version 2.0 (the "License");
+        -:    4://  you may not use this file except in compliance with the License.
+        -:    5://  You may obtain a copy of the License at
+        -:    6://
+        -:    7://      http://www.apache.org/licenses/LICENSE-2.0
+        -:    8://
+        -:    9://  Unless required by applicable law or agreed to in writing, software
+        -:   10://  distributed under the License is distributed on an "AS IS" BASIS,
+        -:   11://  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        -:   12://  See the License for the specific language governing permissions and
+        -:   13://  limitations under the License.
+        -:   14:
+        -:   15:
+        -:   16:// ---------------------------------------------------------------------
+        -:   17://
+        -:   18:// * The skip-gram model learns co-occurrence information between a
+        -:   19://   word and a fixed-length window of context words on either side of
+        -:   20://   it.  The embedding of the central word is called the "input"
+        -:   21://   representation and the embeddings of the left and right context
+        -:   22://   words are "output" representations.  This distinction (and
+        -:   23://   terminology) are quite important for understanding the code so here
+        -:   24://   is an example, assumping a context window of two words on either
+        -:   25://   side:
+        -:   26://
+        -:   27://     The quick brown fox jumped over the lazy dog.
+        -:   28://                ^     ^    ^     ^    ^
+        -:   29://                |     |    |     |    |
+        -:   30://           output output input output output
+        -:   31://
+        -:   32://   When looking at the input word "jumped" in this sentence, the
+        -:   33://   skip-gram with negative sampling (SGNS) model learns that it
+        -:   34://   co-occurs with "brown" and "fox" and "over" and "the" and does not
+        -:   35://   co-occur with a selection of negative-sample words (perhaps
+        -:   36://   "apple", "of", and "slithered").
+        -:   37://
+        -:   38:// Partial call graph:
+        -:   39://
+        -:   40://   main
+        -:   41://   |
+        -:   42://   L- TrainModel
+        -:   43://      |
+        -:   44://      |- ReadVocab
+        -:   45://      |  |- ReadWord
+        -:   46://      |  |- AddWordToVocab
+        -:   47://      |  L- SortVocab
+        -:   48://      |
+        -:   49://      |- LearnVocabFromTrainFile
+        -:   50://      |  |- ReadWord
+        -:   51://      |  |- AddWordToVocab
+        -:   52://      |  |- SearchVocab
+        -:   53://      |  |- ReduceVocab
+        -:   54://      |  L- SortVocab
+        -:   55://      |
+        -:   56://      |- SaveVocab
+        -:   57://      |- InitNet
+        -:   58://      |- InitUnigramTable
+        -:   59://      |
+        -:   60://      L- TrainModelThread
+        -:   61://         L- ReadWordIndex
+        -:   62://            |- ReadWord
+        -:   63://            L- SearchVocab
+        -:   64://
+        -:   65:// ---------------------------------------------------------------------
+        -:   66:
+        -:   67:
+        -:   68:#include <stdio.h>
+        -:   69:#include <stdlib.h>
+        -:   70:#include <string.h>
+        -:   71:#include <math.h>
+        -:   72:#include <time.h>
+        -:   73:
+        -:   74:// max length of filenames, vocabulary words (including null terminator)
+        -:   75:#define MAX_STRING 100
+        -:   76:// size of pre-computed e^x / (e^x + 1) table
+        -:   77:#define EXP_TABLE_SIZE 1000
+        -:   78:// max exponent x for which to pre-compute e^x / (e^x + 1)
+        -:   79:#define MAX_EXP 6
+        -:   80:// max length (in words) of a sequence of overlapping word contexts or
+        -:   81:// "sentences" (if there is a sequence of words longer than this not
+        -:   82:// explicitly broken up into multiple "sentences" in the training data,
+        -:   83:// it will be broken up into multiple "sentences" of length no longer
+        -:   84:// than `MAX_SENTENCE_LENGTH` each during training)
+        -:   85:#define MAX_SENTENCE_LENGTH 1000
+        -:   86:// max length of Huffman codes used by hierarchical softmax
+        -:   87:#define MAX_CODE_LENGTH 40
+        -:   88:
+        -:   89:
+        -:   90:// Maximum 30 * 0.7 = 21M words in the vocabulary
+        -:   91:// (where 0.7 is the magical load factor beyond which hash table
+        -:   92:// performance degrades)
+        -:   93:const int vocab_hash_size = 30000000;
+        -:   94:
+        -:   95:// Negative sampling distribution represented by 1e8-element discrete
+        -:   96:// sample from smoothed empirical unigram distribution.
+        -:   97:const int table_size = 1e8;
+        -:   98:
+        -:   99:// Set precision of real numbers
+        -:  100:typedef float real;
+        -:  101:
+        -:  102:// Representation of a word in the vocabulary, including Huffman coding
+        -:  103:struct vocab_word {
+        -:  104:  long long cn;
+        -:  105:  int *point;
+        -:  106:  char *word, *code, codelen;
+        -:  107:};
+        -:  108:
+        -:  109:struct vocab_word *vocab;
+        -:  110:
+        -:  111:char train_file[MAX_STRING], output_file[MAX_STRING], save_vocab_file[MAX_STRING], read_vocab_file[MAX_STRING];
+        -:  112:
+        -:  113:int binary = 1, cbow = 0, debug_mode = 2, window = 5, min_count = 5, num_threads = 1, min_reduce = 1, hs = 1, negative = 5;
+        -:  114:
+        -:  115:int *vocab_hash, *table;
+        -:  116:
+        -:  117:long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100, train_words = 0, word_count_actual = 0, iter = 5, file_size = 0, classes = 0;
+        -:  118:
+        -:  119:real alpha = 0.025, starting_alpha, sample = 1e-3; 
+        -:  120:
+        -:  121:real *syn0, *syn1, *syn1neg, *expTable;
+        -:  122:
+        -:  123:clock_t start;                 // start time of training algorithm
+        -:  124:
+        -:  125:// Allocate and populate negative-sampling data structure `table`, an
+        -:  126:// array of `table_size` words distributed approximately according to
+        -:  127:// the empirical unigram distribution (smoothed by raising all
+        -:  128:// probabilities to the power of 0.75 and re-normalizing), from `vocab`,
+        -:  129:// an array of `vocab_size` words represented as `vocab_word` structs.
+function InitUnigramTable called 1 returned 100% blocks executed 91%
+        1:  130:void InitUnigramTable() {
+        -:  131:    int a, i;
+        -:  132:    double train_words_pow = 0;
+        -:  133:    double d1, power = 0.75;
+        -:  134:    // allocate memory
+        1:  135:    table = (int *)malloc(table_size * sizeof(int));
+        -:  136:    // compute normalizer, `train_words_pow`
+    71292:  137:    for (a = 0; a < vocab_size; a++) train_words_pow += pow(vocab[a].cn, power);
+branch  0 taken 71291
+branch  1 taken 1 (fallthrough)
+        -:  138:    // initialize vocab position `i` and cumulative probability mass `d1`
+        -:  139:    i = 0;
+        1:  140:    d1 = pow(vocab[i].cn, power) / train_words_pow;
+100000001:  141:    for (a = 0; a < table_size; a++) {
+branch  0 taken 100000000
+branch  1 taken 1 (fallthrough)
+100000000:  142:        table[a] = i;
+100000000:  143:        if (a / (double)table_size > d1) {
+branch  0 taken 71290 (fallthrough)
+branch  1 taken 99928710
+    71290:  144:        i++;
+    71290:  145:        d1 += pow(vocab[i].cn, power) / train_words_pow;
+        -:  146:        }
+100000000*:  147:        if (i >= vocab_size) i = vocab_size - 1;
+branch  0 taken 0 (fallthrough)
+branch  1 taken 100000000
+        -:  148:    }
+        1:  149:}
+        -:  150:
+        -:  151:// Read a single word from file `fin` into length `MAX_STRING` array
+        -:  152:// `word`, terminating with a null byte, treating space, tab, and
+        -:  153:// newline as word boundaries.  Ignore carriage returns.  If the first
+        -:  154:// character read (excluding carriage returns) is a newline, set `word`
+        -:  155:// to "</s>" and return.  If a newline is encountered after reading one
+        -:  156:// or more non-boundary characters, put that newline back into the
+        -:  157:// stream and leave word as the non-boundary characters up to that point
+        -:  158:// (so that the next time this function is called the newline will be
+        -:  159:// read and `word` will be set to "</s>").  If the number of
+        -:  160:// non-boundary characters is equal to or greater than `MAX_STRING`,
+        -:  161:// read and ignore the trailing characters.  If we reach end of file,
+        -:  162:// set `eof` to 1.
+function ReadWord called 34010414 returned 100% blocks executed 86%
+ 34010414:  163:void ReadWord(char *word, FILE *fin, char *eof) {
+        -:  164:    int a = 0, ch;
+        -:  165:    while (1) {
+        -:  166:        ch = getc_unlocked(fin);
+200000002:  167:        if (ch == EOF) {
+branch  0 taken 2 (fallthrough)
+branch  1 taken 200000000
+        2:  168:        *eof = 1;
+        2:  169:        break;
+        -:  170:        }
+200000000*:  171:        if (ch == '\r') continue;  // skip carriage returns
+branch  0 taken 0 (fallthrough)
+branch  1 taken 200000000
+200000000:  172:        if ((ch == ' ') || (ch == '\t') || (ch == '\n')) {
+branch  0 taken 165989586 (fallthrough)
+branch  1 taken 34010414
+branch  2 taken 0 (fallthrough)
+branch  3 taken 165989586
+ 34010414:  173:        if (a > 0) {
+branch  0 taken 34010412 (fallthrough)
+branch  1 taken 2
+34010412*:  174:            if (ch == '\n') ungetc(ch, fin);
+branch  0 taken 0 (fallthrough)
+branch  1 taken 34010412
+call    2 never executed
+        -:  175:            break;
+        -:  176:        }
+        2:  177:        if (ch == '\n') {
+branch  0 taken 0 (fallthrough)
+branch  1 taken 2
+        -:  178:            strcpy(word, (char *)"</s>");
+    #####:  179:            return;
+        2:  180:        } else continue;
+        -:  181:        }
+165989586:  182:        word[a] = ch;
+165989586:  183:        a++;
+165989586:  184:        if (a >= MAX_STRING - 1) a--;   // Truncate too-long words
+branch  0 taken 165989582
+branch  1 taken 4 (fallthrough)
+        -:  185:    }
+ 34010414:  186:    word[a] = 0;
+        -:  187:}
+        -:  188:
+        -:  189:// Return hash (integer between 0, inclusive, and `vocab_hash_size`,
+        -:  190:// exclusive) of `word`
+function GetWordHash called 34335558 returned 100% blocks executed 100%
+ 34335558:  191:int GetWordHash(char *word) {
+        -:  192:    unsigned long long a, hash = 0;
+202838085:  193:    for (a = 0; a < strlen(word); a++) hash = hash * 257 + word[a];
+branch  0 taken 168502527
+branch  1 taken 34335558 (fallthrough)
+ 34335558:  194:    hash = hash % vocab_hash_size;
+ 34335558:  195:    return hash;
+        -:  196:}
+        -:  197:
+        -:  198:// Return position of `word` in vocabulary `vocab` using `vocab_hash`,
+        -:  199:// a linear-probing hash table; if the word is not found, return -1.
+function SearchVocab called 34010412 returned 100% blocks executed 100%
+ 34010412:  200:int SearchVocab(char *word) {
+        -:  201:    // compute initial hash
+ 34010412:  202:    unsigned int hash = GetWordHash(word);
+        -:  203:    while (1) {
+        -:  204:        // return -1 if cell is empty
+ 34020150:  205:        if (vocab_hash[hash] == -1) return -1;
+branch  0 taken 33479933 (fallthrough)
+branch  1 taken 540217
+        -:  206:        // return position at current hash if word is a match
+ 33479933:  207:        if (!strcmp(word, vocab[vocab_hash[hash]].word)) return vocab_hash[hash];
+branch  0 taken 33470195 (fallthrough)
+branch  1 taken 9738
+        -:  208:        // no match, increment hash
+     9738:  209:        hash = (hash + 1) % vocab_hash_size;
+        -:  210:    }
+        -:  211:    return -1;
+        -:  212:}
+        -:  213:
+        -:  214:// Read a word from file `fin` and return its position in vocabulary
+        -:  215:// `vocab`.  If the next thing in the file is a newline, return 0 (the
+        -:  216:// index of "</s>").  If the word is not in the vocabulary, return -1.
+        -:  217:// If the end of file is reached, set `eof` to 1 and return -1.  TODO:
+        -:  218:// if the file is not newline-terminated, the last word will be
+        -:  219:// swallowed (-1 will be returned because we have reached EOF, even if
+        -:  220:// a word was read).
+function ReadWordIndex called 17005207 returned 100% blocks executed 100%
+ 17005207:  221:int ReadWordIndex(FILE *fin, char *eof) {
+ 17005207:  222:    char word[MAX_STRING], eof_l = 0;
+ 17005207:  223:    ReadWord(word, fin, &eof_l);
+call    0 returned 17005207
+ 17005207:  224:    if (eof_l) {
+branch  0 taken 1 (fallthrough)
+branch  1 taken 17005206
+        1:  225:        *eof = 1;
+        1:  226:        return -1;
+        -:  227:    }
+ 17005206:  228:    return SearchVocab(word);
+call    0 returned 17005206
+        -:  229:}
+        -:  230:
+        -:  231:// Add word `word` to first empty slot in vocabulary `vocab`, increment
+        -:  232:// vocabulary length `vocab_size`, increase `vocab_max_size` by
+        -:  233:// increments of 1000 (increasing `vocab` allocation) as needed, and set
+        -:  234:// position of that slot in vocabulary hash table `vocab_hash`.
+        -:  235:// Return index of `word` in `vocab`.
+function AddWordToVocab called 253855 returned 100% blocks executed 100%
+   253855:  236:int AddWordToVocab(char *word) {
+   253855:  237:    unsigned int hash, length = strlen(word) + 1;
+        -:  238:    if (length > MAX_STRING) length = MAX_STRING;
+        -:  239:    // add word to `vocab` and increment `vocab_size`
+   253855:  240:    vocab[vocab_size].word = (char *)calloc(length, sizeof(char));
+branch  0 taken 253 (fallthrough)
+branch  1 taken 253602
+        -:  241:    // TODO: this may blow up if strlen(word) + 1 > MAX_STRING
+        -:  242:    strcpy(vocab[vocab_size].word, word);
+   253855:  243:    vocab[vocab_size].cn = 0;
+   253855:  244:    vocab_size++;
+        -:  245:    // Reallocate memory if needed
+   253855:  246:    if (vocab_size + 2 >= vocab_max_size) {
+branch  0 taken 253 (fallthrough)
+branch  1 taken 253602
+      253:  247:        vocab_max_size += 1000;
+      253:  248:        vocab = (struct vocab_word *)realloc(vocab, vocab_max_size * sizeof(struct vocab_word));
+        -:  249:    }
+        -:  250:    // add word vocabulary position to `vocab_hash`
+   253855:  251:    hash = GetWordHash(word);
+   255059:  252:    while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;
+branch  0 taken 1204
+branch  1 taken 253855 (fallthrough)
+   253855:  253:    vocab_hash[hash] = vocab_size - 1;
+   253855:  254:    return vocab_size - 1;
+        -:  255:}
+        -:  256:
+        -:  257:// Given pointers `a` and `b` to `vocab_word` structs, return 1 if the
+        -:  258:// stored count `cn` of b is greater than that of a, -1 if less than,
+        -:  259:// and 0 if equal.  (Comparator for a reverse sort by word count.)
+function VocabCompare called 3313468 returned 100% blocks executed 100%
+  3313468:  260:int VocabCompare(const void *a, const void *b) {
+  3313468:  261:    long long l = ((struct vocab_word *)b)->cn - ((struct vocab_word *)a)->cn;
+  3313468:  262:    if (l > 0) return 1;
+branch  0 taken 2189902 (fallthrough)
+branch  1 taken 1123566
+  2189902:  263:    if (l < 0) return -1;
+branch  0 taken 340647 (fallthrough)
+branch  1 taken 1849255
+        -:  264:    return 0;
+        -:  265:}
+        -:  266:
+        -:  267:// Sort vocabulary `vocab` by word count, decreasing, while removing
+        -:  268:// words that have count less than `min_count`; re-compute `vocab_hash`
+        -:  269:// accordingly; shrink vocab memory allocation to minimal size.
+function SortVocab called 1 returned 100% blocks executed 100%
+        1:  270:void SortVocab() {
+        -:  271:    int a, size;
+        -:  272:    unsigned int hash;
+        -:  273:    // Sort the vocabulary but keep "</s>" at the first position
+        1:  274:    qsort(&vocab[1], vocab_size - 1, sizeof(struct vocab_word), VocabCompare);
+call    0 returned 1
+        -:  275:    // clear `vocab_hash` cells
+ 30000001:  276:    for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
+branch  0 taken 30000000
+branch  1 taken 1 (fallthrough)
+        -:  277:    // save initial `vocab_size` (we will decrease `vocab_size` as we
+        -:  278:    // prune infrequent words)
+        1:  279:    size = vocab_size;
+        -:  280:    // initialize total word count
+        1:  281:    train_words = 0;
+   253856:  282:    for (a = 0; a < size; a++) {
+branch  0 taken 253855
+branch  1 taken 1 (fallthrough)
+   253855:  283:        if ((vocab[a].cn < min_count) && (a != 0)) {
+branch  0 taken 182565 (fallthrough)
+branch  1 taken 71290
+branch  2 taken 182564 (fallthrough)
+branch  3 taken 1
+        -:  284:        // word is infrequent and not "</s>", discard it
+   182564:  285:        vocab_size--;
+   182564:  286:        free(vocab[a].word);
+        -:  287:        } else {
+        -:  288:        // word is frequent or "</s>", add to hash table
+    71291:  289:        hash=GetWordHash(vocab[a].word);
+    71402:  290:        while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;
+branch  0 taken 111
+branch  1 taken 71291 (fallthrough)
+    71291:  291:        vocab_hash[hash] = a;
+    71291:  292:        train_words += vocab[a].cn;
+        -:  293:        }
+        -:  294:    }
+        -:  295:    // shrink vocab memory allocation to minimal size
+        -:  296:    // TODO: to be safe we should probably update vocab_max_size which
+        -:  297:    // seems to be interpreted as the allocation size
+        1:  298:    vocab = (struct vocab_word *)realloc(vocab, (vocab_size + 1) * sizeof(struct vocab_word));
+        -:  299:    // Allocate memory for the binary tree construction
+    71292:  300:    for (a = 0; a < vocab_size; a++) {
+branch  0 taken 71291
+branch  1 taken 1 (fallthrough)
+    71291:  301:        vocab[a].code = (char *)calloc(MAX_CODE_LENGTH, sizeof(char));
+    71291:  302:        vocab[a].point = (int *)calloc(MAX_CODE_LENGTH, sizeof(int));
+        -:  303:    }
+        1:  304:}
+        -:  305:
+        -:  306:// Reduce vocabulary `vocab` size by removing words with count equal to
+        -:  307:// `min_reduce` or less, in order to make room in hash table (not for
+        -:  308:// mitigating data sparsity).  Increment `min_reduce` by one, so that
+        -:  309:// this function can be called in a loop until there is enough space.
+function ReduceVocab called 0 returned 0% blocks executed 0%
+    #####:  310:void ReduceVocab() {
+        -:  311:    int a, b = 0;
+        -:  312:    unsigned int hash;
+    #####:  313:    for (a = 0; a < vocab_size; a++) if (vocab[a].cn > min_reduce) {
+branch  0 never executed
+branch  1 never executed
+branch  2 never executed
+branch  3 never executed
+    #####:  314:        vocab[b].cn = vocab[a].cn;
+    #####:  315:        vocab[b].word = vocab[a].word;
+    #####:  316:        b++;
+    #####:  317:    } else free(vocab[a].word);
+    #####:  318:    vocab_size = b;
+    #####:  319:    for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
+branch  0 never executed
+branch  1 never executed
+        -:  320:    // recompute `vocab_hash` as we have removed some items and it may
+        -:  321:    // now be broken
+    #####:  322:    for (a = 0; a < vocab_size; a++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  323:        hash = GetWordHash(vocab[a].word);
+    #####:  324:        while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;
+branch  0 never executed
+branch  1 never executed
+    #####:  325:        vocab_hash[hash] = a;
+        -:  326:    }
+    #####:  327:    fflush(stdout);
+call    0 never executed
+    #####:  328:    min_reduce++;
+    #####:  329:}
+        -:  330:
+        -:  331:// Create binary Huffman tree from word counts in `vocab`, storing
+        -:  332:// codes in `vocab`; frequent words will have short uniqe binary codes.
+        -:  333:// Used by hierarchical softmax.
+function CreateBinaryTree called 1 returned 100% blocks executed 100%
+        1:  334:void CreateBinaryTree() {
+        -:  335:    long long a, b, i, min1i, min2i, pos1, pos2, point[MAX_CODE_LENGTH];
+        -:  336:    char code[MAX_CODE_LENGTH];
+        1:  337:    long long *count = (long long *)calloc(vocab_size * 2 + 1, sizeof(long long));
+        1:  338:    long long *binary = (long long *)calloc(vocab_size * 2 + 1, sizeof(long long));
+        1:  339:    long long *parent_node = (long long *)calloc(vocab_size * 2 + 1, sizeof(long long));
+    71292:  340:    for (a = 0; a < vocab_size; a++) count[a] = vocab[a].cn;
+branch  0 taken 71291
+branch  1 taken 1 (fallthrough)
+    71292:  341:    for (a = vocab_size; a < vocab_size * 2; a++) count[a] = 1e15;
+branch  0 taken 71291
+branch  1 taken 1 (fallthrough)
+        1:  342:    pos1 = vocab_size - 1;
+        -:  343:    pos2 = vocab_size;
+        -:  344:    // Following algorithm constructs the Huffman tree by adding one node at a time
+    71291:  345:    for (a = 0; a < vocab_size - 1; a++) {
+branch  0 taken 71290
+branch  1 taken 1 (fallthrough)
+        -:  346:        // First, find two smallest nodes 'min1, min2'
+    71290:  347:        if (pos1 >= 0) {
+branch  0 taken 71280 (fallthrough)
+branch  1 taken 10
+    71280:  348:        if (count[pos1] < count[pos2]) {
+branch  0 taken 35695 (fallthrough)
+branch  1 taken 35585
+        -:  349:            min1i = pos1;
+    35695:  350:            pos1--;
+        -:  351:        } else {
+        -:  352:            min1i = pos2;
+    35585:  353:            pos2++;
+        -:  354:        }
+        -:  355:        } else {
+        -:  356:        min1i = pos2;
+       10:  357:        pos2++;
+        -:  358:        }
+    71290:  359:        if (pos1 >= 0) {
+branch  0 taken 71279 (fallthrough)
+branch  1 taken 11
+    71279:  360:        if (count[pos1] < count[pos2]) {
+branch  0 taken 35596 (fallthrough)
+branch  1 taken 35683
+        -:  361:            min2i = pos1;
+    35596:  362:            pos1--;
+        -:  363:        } else {
+        -:  364:            min2i = pos2;
+    35683:  365:            pos2++;
+        -:  366:        }
+        -:  367:        } else {
+        -:  368:        min2i = pos2;
+       11:  369:        pos2++;
+        -:  370:        }
+    71290:  371:        count[vocab_size + a] = count[min1i] + count[min2i];
+    71290:  372:        parent_node[min1i] = vocab_size + a;
+    71290:  373:        parent_node[min2i] = vocab_size + a;
+    71290:  374:        binary[min2i] = 1;
+        -:  375:    }
+        -:  376:    // Now assign binary code to each vocabulary word
+    71292:  377:    for (a = 0; a < vocab_size; a++) {
+branch  0 taken 71291
+branch  1 taken 1 (fallthrough)
+        -:  378:        b = a;
+        -:  379:        i = 0;
+        -:  380:        while (1) {
+  1396750:  381:        code[i] = binary[b];
+  1396750:  382:        point[i] = b;
+  1396750:  383:        i++;
+  1396750:  384:        b = parent_node[b];
+  1396750:  385:        if (b == vocab_size * 2 - 2) break;
+branch  0 taken 1325459 (fallthrough)
+branch  1 taken 71291
+        -:  386:        }
+    71291:  387:        vocab[a].codelen = i;
+    71291:  388:        vocab[a].point[0] = vocab_size - 2;
+  1468041:  389:        for (b = 0; b < i; b++) {
+branch  0 taken 1396750
+branch  1 taken 71291 (fallthrough)
+  1396750:  390:        vocab[a].code[i - b - 1] = code[b];
+  1396750:  391:        vocab[a].point[i - b] = point[b] - vocab_size;
+        -:  392:        }
+        -:  393:    }
+        1:  394:    free(count);
+        1:  395:    free(binary);
+        1:  396:    free(parent_node);
+        1:  397:}
+        -:  398:
+        -:  399:// Compute vocabulary `vocab` and corresponding hash table `vocab_hash`
+        -:  400:// from text in `train_file`.  Insert </s> as vocab item 0.  Prune vocab
+        -:  401:// incrementally (as needed to keep number of items below effective hash
+        -:  402:// table capacity).  After reading file, sort vocabulary by word count,
+        -:  403:// decreasing.
+function LearnVocabFromTrainFile called 1 returned 100% blocks executed 90%
+        1:  404:void LearnVocabFromTrainFile() {
+        1:  405:    char word[MAX_STRING], eof = 0;
+        -:  406:    FILE *fin;
+        -:  407:    long long a, i, wc = 0;
+ 30000001:  408:    for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
+branch  0 taken 30000000
+branch  1 taken 1 (fallthrough)
+        1:  409:    fin = fopen(train_file, "rb");
+call    0 returned 1
+        1:  410:    if (fin == NULL) {
+branch  0 taken 0 (fallthrough)
+branch  1 taken 1
+        -:  411:        printf("ERROR: training data file not found!\n");
+    #####:  412:        exit(1);
+call    0 never executed
+        -:  413:    }
+        1:  414:    vocab_size = 0;
+        1:  415:    AddWordToVocab((char *)"</s>");
+call    0 returned 1
+        -:  416:    while (1) {
+ 17005207:  417:        ReadWord(word, fin, &eof);
+call    0 returned 17005207
+ 17005207:  418:        if (eof) break;
+branch  0 taken 17005206 (fallthrough)
+branch  1 taken 1
+ 17005206:  419:        train_words++;
+ 17005206:  420:        wc++;
+ 17005206:  421:        if ((debug_mode > 1) && (wc >= 1000000)) {
+branch  0 taken 17005206 (fallthrough)
+branch  1 taken 0
+branch  2 taken 17 (fallthrough)
+branch  3 taken 17005189
+       17:  422:        printf("%lldM%c", train_words / 1000000, 13);
+call    0 returned 17
+       17:  423:        fflush(stdout);
+call    0 returned 17
+        -:  424:        wc = 0;
+        -:  425:        }
+ 17005206:  426:        i = SearchVocab(word);
+call    0 returned 17005206
+ 17005206:  427:        if (i == -1) {
+branch  0 taken 253854 (fallthrough)
+branch  1 taken 16751352
+   253854:  428:        a = AddWordToVocab(word);
+call    0 returned 253854
+   253854:  429:        vocab[a].cn = 1;
+ 16751352:  430:        } else vocab[i].cn++;
+17005206*:  431:        if (vocab_size > vocab_hash_size * 0.7) ReduceVocab();
+branch  0 taken 17005206
+branch  1 taken 0 (fallthrough)
+call    2 never executed
+        -:  432:    }
+        1:  433:    SortVocab();
+call    0 returned 1
+        1:  434:    if (debug_mode > 0) {
+branch  0 taken 1 (fallthrough)
+branch  1 taken 0
+        1:  435:        printf("Vocab size: %lld\n", vocab_size);
+call    0 returned 1
+        1:  436:        printf("Words in train file: %lld\n", train_words);
+call    0 returned 1
+        -:  437:    }
+        1:  438:    file_size = ftell(fin);
+call    0 returned 1
+        1:  439:    fclose(fin);
+call    0 returned 1
+        1:  440:}
+        -:  441:
+        -:  442:// Write vocabulary `vocab` to file `save_vocab_file`, one word per
+        -:  443:// line, with each line containing a word, a space, the word count, and
+        -:  444:// a newline.
+function SaveVocab called 0 returned 0% blocks executed 0%
+    #####:  445:void SaveVocab() {
+        -:  446:    long long i;
+    #####:  447:    FILE *fo = fopen(save_vocab_file, "wb");
+call    0 never executed
+    #####:  448:    for (i = 0; i < vocab_size; i++) fprintf(fo, "%s %lld\n", vocab[i].word, vocab[i].cn);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  449:    fclose(fo);
+call    0 never executed
+    #####:  450:}
+        -:  451:
+        -:  452:// Read vocabulary from file `read_vocab_file` that has one word per
+        -:  453:// line, where each line contains a word, a space, the word count, and a
+        -:  454:// newline.  Store vocabulary in `vocab` and update `vocab_hash`
+        -:  455:// accordingly.  After reading, sort vocabulary by word count,
+        -:  456:// decreasing.
+function ReadVocab called 0 returned 0% blocks executed 0%
+    #####:  457:void ReadVocab() {
+        -:  458:    long long a, i = 0;
+    #####:  459:    char c, eof = 0;
+        -:  460:    char word[MAX_STRING];
+    #####:  461:    FILE *fin = fopen(read_vocab_file, "rb");
+call    0 never executed
+    #####:  462:    if (fin == NULL) {
+branch  0 never executed
+branch  1 never executed
+        -:  463:        printf("Vocabulary file not found\n");
+    #####:  464:        exit(1);
+call    0 never executed
+        -:  465:    }
+    #####:  466:    for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
+branch  0 never executed
+branch  1 never executed
+    #####:  467:    vocab_size = 0;
+        -:  468:    while (1) {
+        -:  469:        // TODO: if file is not newline-terminated, last word may be
+        -:  470:        // swallowed
+    #####:  471:        ReadWord(word, fin, &eof);
+call    0 never executed
+    #####:  472:        if (eof) break;
+branch  0 never executed
+branch  1 never executed
+    #####:  473:        a = AddWordToVocab(word);
+call    0 never executed
+    #####:  474:        fscanf(fin, "%lld%c", &vocab[a].cn, &c);
+call    0 never executed
+        -:  475:        i++;
+        -:  476:    }
+    #####:  477:    SortVocab();
+call    0 never executed
+    #####:  478:    if (debug_mode > 0) {
+branch  0 never executed
+branch  1 never executed
+    #####:  479:        printf("Vocab size: %lld\n", vocab_size);
+call    0 never executed
+    #####:  480:        printf("Words in train file: %lld\n", train_words);
+call    0 never executed
+        -:  481:    }
+    #####:  482:    fin = fopen(train_file, "rb");
+call    0 never executed
+    #####:  483:    if (fin == NULL) {
+branch  0 never executed
+branch  1 never executed
+        -:  484:        printf("ERROR: training data file not found!\n");
+    #####:  485:        exit(1);
+call    0 never executed
+        -:  486:    }
+    #####:  487:    fseek(fin, 0, SEEK_END);
+call    0 never executed
+    #####:  488:    file_size = ftell(fin);
+call    0 never executed
+    #####:  489:    fclose(fin);
+call    0 never executed
+    #####:  490:}
+        -:  491:
+        -:  492:// Allocate memory for and initialize neural network parameters.  Each
+        -:  493:// array has size `vocab_size` x `layer1_size`.
+        -:  494://
+        -:  495://   syn0: input word embeddings, initialized uniformly on
+        -:  496://         [-0.5/`layer1_size`, 0.5/`layer1_size`)
+        -:  497://   syn1: only used by hierarchical softmax; initialized to 0
+        -:  498://   syn1neg: output word embeddings; initialized to zero
+function InitNet called 1 returned 100% blocks executed 81%
+        1:  499:void InitNet() {
+        -:  500:    long long a, b;
+        -:  501:    unsigned long long next_random = 1;
+        1:  502:    a = posix_memalign((void **)&syn0, 128, (long long)vocab_size * layer1_size * sizeof(real));
+branch  0 taken 1 (fallthrough)
+branch  1 taken 0
+       1*:  503:    if (syn0 == NULL) {printf("Memory allocation failed\n"); exit(1);}
+branch  0 taken 0 (fallthrough)
+branch  1 taken 1
+call    2 never executed
+        1:  504:    if (hs) {
+branch  0 taken 1 (fallthrough)
+branch  1 taken 0
+        1:  505:        a = posix_memalign((void **)&syn1, 128, (long long)vocab_size * layer1_size * sizeof(real));
+branch  0 taken 1 (fallthrough)
+branch  1 taken 0
+       1*:  506:        if (syn1 == NULL) {printf("Memory allocation failed\n"); exit(1);}
+branch  0 taken 0 (fallthrough)
+branch  1 taken 1
+call    2 never executed
+  7200392:  507:        for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
+branch  0 taken 7129100
+branch  1 taken 71291 (fallthrough)
+branch  2 taken 71291
+branch  3 taken 1 (fallthrough)
+  7129100:  508:        syn1[a * layer1_size + b] = 0;
+        -:  509:    }
+        1:  510:    if (negative>0) {
+branch  0 taken 1 (fallthrough)
+branch  1 taken 0
+        1:  511:        a = posix_memalign((void **)&syn1neg, 128, (long long)vocab_size * layer1_size * sizeof(real));
+branch  0 taken 1 (fallthrough)
+branch  1 taken 0
+       1*:  512:        if (syn1neg == NULL) {printf("Memory allocation failed\n"); exit(1);}
+branch  0 taken 0 (fallthrough)
+branch  1 taken 1
+call    2 never executed
+  7200392:  513:        for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++)
+branch  0 taken 7129100
+branch  1 taken 71291 (fallthrough)
+branch  2 taken 71291
+branch  3 taken 1 (fallthrough)
+  7129100:  514:        syn1neg[a * layer1_size + b] = 0;
+        -:  515:    }
+  7200392:  516:    for (a = 0; a < vocab_size; a++) for (b = 0; b < layer1_size; b++) {
+branch  0 taken 7129100
+branch  1 taken 71291 (fallthrough)
+branch  2 taken 71291
+branch  3 taken 1 (fallthrough)
+  7129100:  517:        next_random = next_random * (unsigned long long)25214903917 + 11;
+  7129100:  518:        syn0[a * layer1_size + b] = (((next_random & 0xFFFF) / (real)65536) - 0.5) / layer1_size;
+        -:  519:    }
+        1:  520:    CreateBinaryTree();
+call    0 returned 1
+        1:  521:}
+        -:  522:
+        -:  523:// Given allocated and initialized vocabulary `vocab`, corresponding
+        -:  524:// hash `vocab_hash`, and neural network parameters `syn0`, `syn1`, and
+        -:  525:// `syn1neg`, train word2vec model text in `train_file` (storing 
+        -:  526:// learned parameters in `syn0`, `syn1`, and `syn1neg`). 
+        -:  527:
+function TrainModelThread called 1 returned 100% blocks executed 94%
+        1:  528:void *TrainModelThread(void *id) {
+        -:  529:  long long
+        -:  530:    a,                     // loop counter among other things
+        -:  531:    b,                     // offset of dynamic window in max window
+        -:  532:                           //   (if 0, use all `window` output
+        -:  533:                           //   words on each side of input word;
+        -:  534:                           //   otherwise use `window - b` words
+        -:  535:                           //   on each side)
+        -:  536:    d,                     // loop counter among other things
+        -:  537:    cw,                    // (used by CBOW)
+        -:  538:    word,                  // index of output word in vocabulary
+        -:  539:    last_word,             // index of input word in vocabulary
+        -:  540:    sentence_length = 0,   // number of words read into the current
+        -:  541:                           //   sentence
+        -:  542:    sentence_position = 0, // position of current output word in
+        -:  543:                           //   sentence
+        -:  544:    word_count = 0,        // number of words seen so far in this
+        -:  545:                           //   iteration
+        -:  546:    last_word_count = 0,   // number of words seen so far in this
+        -:  547:                           //   iteration, as of the most recent
+        -:  548:                           //   update of terminal output and learning
+        -:  549:                           //   rate
+        -:  550:    l1,                    // input word row offset in syn0
+        -:  551:    l2,                    // output word row offset in syn1, syn1neg
+        -:  552:    c,                     // loop counter among other things
+        -:  553:    target,                // index of output word or negatively-sampled
+        -:  554:                           //   word in vocabulary
+        -:  555:    label,                 // switch between output word (1) and
+        -:  556:                           //   negatively-sampled word (0)
+        1:  557:    local_iter = iter;     // iterations over this thread's chunk of the
+        -:  558:                           //   data set left
+        -:  559:  long long
+        -:  560:    sen[MAX_SENTENCE_LENGTH + 1]; // index of word in vocabulary for
+        -:  561:                                  //   each word in current sentence
+        -:  562:  unsigned long long
+        1:  563:    next_random = (long long)id;  // thread-specific RNG state
+        1:  564:  char eof = 0;            // 1 if end of file has been reached
+        -:  565:  real f, g;               // work space (values of sub-expressions in
+        -:  566:                           //   gradient computation)
+        -:  567:  clock_t now;             // current time during training
+        -:  568:  // allocate memory for gradients
+        -:  569:  real
+        1:  570:    *neu1 = (real *)calloc(layer1_size, sizeof(real)),
+        1:  571:    *neu1e = (real *)calloc(layer1_size, sizeof(real));
+        1:  572:  FILE *fi = fopen(train_file, "rb");
+call    0 returned 1
+        -:  573:
+        1:  574:  fseek(fi, file_size / (long long)id, SEEK_SET);
+call    0 returned 1
+        -:  575:
+        -:  576:  // iteratively read a sentence and train (update gradients) over it;
+        -:  577:  // read over all sentences in this thread's chunk of the training
+        -:  578:  // data `iter` times, then break
+        -:  579:  while (1) {
+        -:  580:    // every 10k words, update progress in terminal and update learning
+        -:  581:    // rate
+  9382001:  582:    if (word_count - last_word_count > 10000) {
+branch  0 taken 1561 (fallthrough)
+branch  1 taken 9380440
+     1561:  583:        word_count_actual += word_count - last_word_count;
+        -:  584:        last_word_count = word_count;
+     1561:  585:        if ((debug_mode > 1)) {
+branch  0 taken 1561 (fallthrough)
+branch  1 taken 0
+     1561:  586:            now=clock();
+call    0 returned 1561
+     1561:  587:            printf("%cAlpha: %f  Progress: %.2f%%  Words/sec: %.2fk  ", 13, alpha,
+     1561:  588:            word_count_actual / (real)(iter * train_words + 1) * 100,
+     1561:  589:            word_count_actual / ((real)(now - start + 1) / (real)CLOCKS_PER_SEC * 1000));
+call    0 returned 1561
+     1561:  590:            fflush(stdout);
+call    0 returned 1561
+        -:  591:        }
+        -:  592:        // linear-decay learning rate (decreases from one toward zero
+        -:  593:        // linearly in number of words seen, but thresholded below
+        -:  594:        // at one ten-thousandth of initial learning rate)
+        -:  595:        // (each word in the data is to be seen `iter` times)
+     1561:  596:        alpha = starting_alpha * (1 - word_count_actual / (real)(iter * train_words + 1));
+    1561*:  597:        if (alpha < starting_alpha * 0.0001) alpha = starting_alpha * 0.0001;
+branch  0 taken 0 (fallthrough)
+branch  1 taken 1561
+        -:  598:    }
+        -:  599:
+        -:  600:    // if we have finished training on the most recently-read sentence
+        -:  601:    // (or we are just starting training), read a new sentence;
+        -:  602:    // truncate each sentence at `MAX_SENTENCE_LENGTH` words (sentences
+        -:  603:    // longer than that will be broken up into smaller sentences)
+  9382001:  604:    if (sentence_length == 0) {
+branch  0 taken 9383
+branch  1 taken 9372618
+        -:  605:      // iteratively read word and add to sentence
+        -:  606:      while (1) {
+ 17005207:  607:        word = ReadWordIndex(fi, &eof);
+call    0 returned 17005207
+ 17005207:  608:        if (eof) break;
+branch  0 taken 17005206 (fallthrough)
+branch  1 taken 1
+        -:  609:        // skip OOV
+ 17005206:  610:        if (word == -1) continue;
+branch  0 taken 286363 (fallthrough)
+branch  1 taken 16718843
+ 16718843:  611:        word_count++;
+        -:  612:        // if EOS, we're done reading this sentence
+ 16718843:  613:        if (word == 0) break;
+branch  0 taken 16718843 (fallthrough)
+branch  1 taken 0
+        -:  614:        // The subsampling randomly discards frequent words while keeping the ranking same
+ 16718843:  615:        if (sample > 0) {
+branch  0 taken 16718843 (fallthrough)
+branch  1 taken 0
+        -:  616:          // discard w.p. 1 - [ sqrt(t / p_{word}) + t / p_{word} ]
+        -:  617:          // (t is the subsampling threshold `sample`, p_{word} is the
+        -:  618:          // ML estimate of the probability of `word` in a unigram LM
+        -:  619:          // (normalized frequency)
+        -:  620:          // TODO: why is this not merely 1 - sqrt(t / p_{word}) as in
+        -:  621:          // the paper?
+ 16718843:  622:          real ran = (sqrt(vocab[word].cn / (sample * train_words)) + 1) * (sample * train_words) / vocab[word].cn;
+ 16718843:  623:          next_random = next_random * (unsigned long long)25214903917 + 11;
+ 16718843:  624:          if (ran < (next_random & 0xFFFF) / (real)65536) continue;
+branch  0 taken 7336779 (fallthrough)
+branch  1 taken 9382064
+        -:  625:        }
+        -:  626:
+  9382064:  627:        sen[sentence_length] = word;
+  9382064:  628:        sentence_length++;
+        -:  629:        // truncate long sentences
+  9382064:  630:        if (sentence_length >= MAX_SENTENCE_LENGTH) break;
+branch  0 taken 9372682
+branch  1 taken 9382 (fallthrough)
+        -:  631:      }
+        -:  632:
+        -:  633:      // set output word position to first word in sentence
+        -:  634:      sentence_position = 0;
+        -:  635:    }
+        -:  636:
+        -:  637:    // if we are at the end of this iteration (sweep over the data),
+        -:  638:    // restart and decrement `local_iter`
+ 9382001*:  639:    if (eof || (word_count > train_words)) {
+branch  0 taken 9382000 (fallthrough)
+branch  1 taken 1
+branch  2 taken 0 (fallthrough)
+branch  3 taken 9382000
+        1:  640:      word_count_actual += word_count - last_word_count;
+        1:  641:      local_iter--;
+        1:  642:      if (local_iter == 0) break;
+branch  0 taken 0 (fallthrough)
+branch  1 taken 1
+        -:  643:      word_count = 0;
+        -:  644:      last_word_count = 0;
+        -:  645:      // signal to read new sentence
+        -:  646:      sentence_length = 0;
+    #####:  647:      fseek(fi, file_size / (long long)id, SEEK_SET);
+call    0 never executed
+    #####:  648:      continue;
+        -:  649:    }
+        -:  650:
+        -:  651:    // get index of output word
+  9382000:  652:    word = sen[sentence_position];
+        -:  653:    // skip OOV (TODO, checked OOV already when reading sentence?)
+ 9382000*:  654:    if (word == -1) continue;
+branch  0 taken 0 (fallthrough)
+branch  1 taken 9382000
+        -:  655:    // reset gradients to zero
+947582000:  656:    for (c = 0; c < layer1_size; c++) neu1[c] = 0;
+branch  0 taken 938200000
+branch  1 taken 9382000 (fallthrough)
+947582000:  657:    for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
+branch  0 taken 938200000
+branch  1 taken 9382000 (fallthrough)
+        -:  658:    // pick dynamic window offset (uniformly at random, between 0
+        -:  659:    // (inclusive) and max window size `window` (exclusive))
+  9382000:  660:    next_random = next_random * (unsigned long long)25214903917 + 11;
+  9382000:  661:    b = next_random % window;
+        -:  662:
+        -:  663:    // SKIP-GRAM
+  9382000:  664:    if (cbow == 0) {
+branch  0 taken 9382000
+branch  1 taken 0
+        -:  665:      // loop over offsets within dynamic window
+        -:  666:      // (relative to max window size)
+ 75076018:  667:      for (a = b; a < window * 2 + 1 - b; a++) if (a != window) {
+branch  0 taken 56312018 (fallthrough)
+branch  1 taken 9382000
+branch  2 taken 65694018
+branch  3 taken 9382000 (fallthrough)
+        -:  668:        // compute position in sentence of input word
+        -:  669:        // (output word pos - max window size + rel offset)
+ 56312018:  670:        c = sentence_position - window + a;
+        -:  671:        // skip if input word position OOB
+        -:  672:        // (note this is our main constraint on word position w.r.t. sentence
+        -:  673:        // bounds)
+ 56312018:  674:        if (c < 0) continue;
+branch  0 taken 65986 (fallthrough)
+branch  1 taken 56246032
+ 56246032:  675:        if (c >= sentence_length) continue;
+branch  0 taken 65846 (fallthrough)
+branch  1 taken 56180186
+        -:  676:        // compute input word index
+ 56180186:  677:        last_word = sen[c];
+        -:  678:        // skip OOV (TODO checked already, should never fire)
+56180186*:  679:        if (last_word == -1) continue;
+branch  0 taken 0 (fallthrough)
+branch  1 taken 56180186
+        -:  680:        // compute input word row offset
+ 56180186:  681:        l1 = last_word * layer1_size;
+        -:  682:        // initialize gradient for input word (work space)
+5674198786:  683:        for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
+branch  0 taken 5618018600
+branch  1 taken 56180186 (fallthrough)
+        -:  684:
+        -:  685:        // SKIP-GRAM HIERARCHICAL SOFTMAX
+836395228:  686:        if (hs) for (d = 0; d < vocab[word].codelen; d++) {
+branch  0 taken 56180186
+branch  1 taken 0
+branch  2 taken 780215042
+branch  3 taken 56180186 (fallthrough)
+        -:  687:          f = 0;
+780215042:  688:          l2 = vocab[word].point[d] * layer1_size;
+        -:  689:          // Propagate hidden -> output
+78801719242:  690:          for (c = 0; c < layer1_size; c++) f += syn0[c + l1] * syn1[c + l2];
+branch  0 taken 78021504200
+branch  1 taken 780215042 (fallthrough)
+780215042:  691:          if (f <= -MAX_EXP) continue;
+branch  0 taken 4646503 (fallthrough)
+branch  1 taken 775568539
+775568539:  692:          else if (f >= MAX_EXP) continue;
+branch  0 taken 283202 (fallthrough)
+branch  1 taken 775285337
+775285337:  693:          else f = expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
+        -:  694:          // 'g' is the gradient multiplied by the learning rate
+775285337:  695:          g = (1 - vocab[word].code[d] - f) * alpha;
+        -:  696:          // Propagate errors output -> hidden
+78303819037:  697:          for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1[c + l2];
+branch  0 taken 77528533700
+branch  1 taken 775285337
+        -:  698:          // Learn weights hidden -> output
+78303819037:  699:          for (c = 0; c < layer1_size; c++) syn1[c + l2] += g * syn0[c + l1];
+branch  0 taken 77528533700
+branch  1 taken 775285337 (fallthrough)
+        -:  700:        }
+        -:  701:
+        -:  702:        // SKIP-GRAM NEGATIVE SAMPLING
+393261302:  703:        if (negative > 0) for (d = 0; d < negative + 1; d++) {
+branch  0 taken 56180186
+branch  1 taken 0
+branch  2 taken 337081116
+branch  3 taken 56180186 (fallthrough)
+337081116:  704:          if (d == 0) {
+branch  0 taken 280900930 (fallthrough)
+branch  1 taken 56180186
+        -:  705:            // fetch output word
+        -:  706:            target = word;
+        -:  707:            label = 1;
+        -:  708:          } else {
+        -:  709:            // fetch negative-sampled word
+280900930:  710:            next_random = next_random * (unsigned long long)25214903917 + 11;
+280900930:  711:            target = table[(next_random >> 16) % table_size];
+280900930:  712:            if (target == 0) target = next_random % (vocab_size - 1) + 1;
+branch  0 taken 10 (fallthrough)
+branch  1 taken 280900920
+280900930:  713:            if (target == word) continue;
+branch  0 taken 131383 (fallthrough)
+branch  1 taken 280769547
+        -:  714:            label = 0;
+        -:  715:          }
+336949733:  716:          l2 = target * layer1_size; // output/neg-sample word row offset
+        -:  717:          // compute f = < v_{w_I}', v_{w_O} >
+        -:  718:          // (inner product for neg sample)
+        -:  719:          f = 0;
+34031923033:  720:          for (c = 0; c < layer1_size; c++) f += syn0[c + l1] * syn1neg[c + l2];
+branch  0 taken 33694973300
+branch  1 taken 336949733 (fallthrough)
+        -:  721:          // compute gradient coeff g = alpha * (label - 1 / (e^-f + 1))
+        -:  722:          // (alpha is learning rate, label is 1 for output and 0 for neg)
+336949733:  723:          if (f > MAX_EXP) g = (label - 1) * alpha;
+branch  0 taken 133534 (fallthrough)
+branch  1 taken 336816199
+336816199:  724:          else if (f < -MAX_EXP) g = (label - 0) * alpha;
+branch  0 taken 58270 (fallthrough)
+branch  1 taken 336757929
+336757929:  725:          else g = (label - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
+        -:  726:          // contribute to gradient for input word
+34031923033:  727:          for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1neg[c + l2];
+branch  0 taken 33694973300
+branch  1 taken 336949733
+        -:  728:          // perform gradient step for output/neg-sample word
+34031923033:  729:          for (c = 0; c < layer1_size; c++) syn1neg[c + l2] += g * syn0[c + l1];
+branch  0 taken 33694973300
+branch  1 taken 336949733 (fallthrough)
+        -:  730:        }
+        -:  731:
+        -:  732:        // now that we've taken gradient step for output and all neg sample
+        -:  733:        // words, take gradient step for input word
+5674198786:  734:        for (c = 0; c < layer1_size; c++) syn0[c + l1] += neu1e[c];
+branch  0 taken 5618018600
+branch  1 taken 56180186 (fallthrough)
+        -:  735:      }
+        -:  736:    }
+        -:  737:
+        -:  738:    // update to next output word; if we are at end of sentence, signal
+        -:  739:    // to read new sentence
+  9382000:  740:    sentence_position++;
+  9382000:  741:    if (sentence_position >= sentence_length) {
+branch  0 taken 9372618
+branch  1 taken 9382 (fallthrough)
+        -:  742:      sentence_length = 0;
+     9382:  743:      continue;
+        -:  744:    }
+        -:  745:  }
+        -:  746:
+        -:  747:  // clean up
+        1:  748:  fclose(fi);
+call    0 returned 1
+        1:  749:  free(neu1);
+        1:  750:  free(neu1e);
+        1:  751:}
+        -:  752:
+        -:  753:// Train word embeddings on text in `train_file` using one or more
+        -:  754:// threads, either learning vocabulary from that training data (in a
+        -:  755:// separate pass over the data) or loading the vocabulary from a file
+        -:  756:// `read_vocab_file`.  Optionally save vocabulary to a file
+        -:  757:// `save_vocab_file`; either save word embeddings to a file
+        -:  758:// `output_file` or, if `classes` is greater than zero, run k-means
+        -:  759:// clustering and save those clusters to `output_file`.
+        -:  760://
+        -:  761:// If `output_file` is empty (first byte is null), do not train; this
+        -:  762:// can be used to learn the vocabulary only from a training text file.
+function TrainModel called 1 returned 100% blocks executed 42%
+        1:  763:void TrainModel() {
+call    0 returned 1
+        -:  764:    long a, b, c, d; // loop counters among other things
+        -:  765:    FILE *fo;        // output file
+        -:  766:
+        -:  767:    printf("Starting training using file %s\n", train_file);
+        -:  768:
+        -:  769:    // initialize learning rate
+        1:  770:    starting_alpha = alpha;
+        -:  771:
+        -:  772:    // read vocab from file or learn from training data
+       1*:  773:    if (read_vocab_file[0] != 0) ReadVocab(); else LearnVocabFromTrainFile();
+branch  0 taken 0 (fallthrough)
+branch  1 taken 1
+call    2 never executed
+call    3 returned 1
+        -:  774:    // save vocab to file
+       1*:  775:    if (save_vocab_file[0] != 0) SaveVocab();
+branch  0 taken 0 (fallthrough)
+branch  1 taken 1
+call    2 never executed
+        -:  776:    // if no `output_file` is specified, exit (do not train)
+        1:  777:    if (output_file[0] == 0) return;
+branch  0 taken 1 (fallthrough)
+branch  1 taken 0
+        -:  778:
+        -:  779:    // initialize network parameters
+        1:  780:    InitNet();
+call    0 returned 1
+        -:  781:    // initialize negative sampling distribution
+        1:  782:    if (negative > 0) InitUnigramTable();
+branch  0 taken 1 (fallthrough)
+branch  1 taken 0
+call    2 returned 1
+        -:  783:
+        1:  784:    start = clock();
+call    0 returned 1
+        2:  785:    for(int i=0; i<iter; i++)
+branch  0 taken 1
+branch  1 taken 1 (fallthrough)
+        1:  786:        TrainModelThread((void*)a);
+call    0 returned 1
+        1:  787:    fo = fopen(output_file, "wb");
+call    0 returned 1
+        1:  788:    if (classes == 0) {
+branch  0 taken 1 (fallthrough)
+branch  1 taken 0
+        -:  789:        // Save the word vectors
+        1:  790:        fprintf(fo, "%lld %lld\n", vocab_size, layer1_size);
+call    0 returned 1
+    71292:  791:        for (a = 0; a < vocab_size; a++) {
+branch  0 taken 71291
+branch  1 taken 1
+    71291:  792:        fprintf(fo, "%s ", vocab[a].word);
+call    0 returned 71291
+  7200391:  793:        if (binary) for (b = 0; b < layer1_size; b++) fwrite(&syn0[a * layer1_size + b], sizeof(real), 1, fo);
+branch  0 taken 71291
+branch  1 taken 0
+call    2 returned 7129100
+branch  3 taken 7129100
+branch  4 taken 71291
+    #####:  794:        else for (b = 0; b < layer1_size; b++) fprintf(fo, "%lf ", syn0[a * layer1_size + b]);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+        -:  795:        fprintf(fo, "\n");
+        -:  796:        }
+        -:  797:    } else {
+        -:  798:        // Run K-means on the word vectors
+    #####:  799:        int clcn = classes, iter = 10, closeid;
+    #####:  800:        int *centcn = (int *)malloc(classes * sizeof(int));
+    #####:  801:        int *cl = (int *)calloc(vocab_size, sizeof(int));
+        -:  802:        real closev, x;
+    #####:  803:        real *cent = (real *)calloc(classes * layer1_size, sizeof(real));
+    #####:  804:        for (a = 0; a < vocab_size; a++) cl[a] = a % clcn;
+branch  0 never executed
+branch  1 never executed
+    #####:  805:        for (a = 0; a < iter; a++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  806:        for (b = 0; b < clcn * layer1_size; b++) cent[b] = 0;
+branch  0 never executed
+branch  1 never executed
+    #####:  807:        for (b = 0; b < clcn; b++) centcn[b] = 1;
+branch  0 never executed
+branch  1 never executed
+    #####:  808:        for (c = 0; c < vocab_size; c++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  809:            for (d = 0; d < layer1_size; d++) cent[layer1_size * cl[c] + d] += syn0[c * layer1_size + d];
+branch  0 never executed
+branch  1 never executed
+    #####:  810:            centcn[cl[c]]++;
+        -:  811:        }
+    #####:  812:        for (b = 0; b < clcn; b++) {
+branch  0 never executed
+branch  1 never executed
+        -:  813:            closev = 0;
+    #####:  814:            for (c = 0; c < layer1_size; c++) {
+branch  0 never executed
+branch  1 never executed
+    #####:  815:            cent[layer1_size * b + c] /= centcn[b];
+    #####:  816:            closev += cent[layer1_size * b + c] * cent[layer1_size * b + c];
+        -:  817:            }
+    #####:  818:            closev = sqrt(closev);
+    #####:  819:            for (c = 0; c < layer1_size; c++) cent[layer1_size * b + c] /= closev;
+branch  0 never executed
+branch  1 never executed
+        -:  820:        }
+    #####:  821:        for (c = 0; c < vocab_size; c++) {
+branch  0 never executed
+branch  1 never executed
+        -:  822:            closev = -10;
+        -:  823:            closeid = 0;
+    #####:  824:            for (d = 0; d < clcn; d++) {
+branch  0 never executed
+branch  1 never executed
+        -:  825:            x = 0;
+    #####:  826:            for (b = 0; b < layer1_size; b++) x += cent[layer1_size * d + b] * syn0[c * layer1_size + b];
+branch  0 never executed
+branch  1 never executed
+    #####:  827:            if (x > closev) {
+branch  0 never executed
+branch  1 never executed
+        -:  828:                closev = x;
+    #####:  829:                closeid = d;
+        -:  830:            }
+        -:  831:            }
+    #####:  832:            cl[c] = closeid;
+        -:  833:        }
+        -:  834:        }
+        -:  835:        // Save the K-means classes
+    #####:  836:        for (a = 0; a < vocab_size; a++) fprintf(fo, "%s %d\n", vocab[a].word, cl[a]);
+call    0 never executed
+branch  1 never executed
+branch  2 never executed
+    #####:  837:        free(centcn);
+    #####:  838:        free(cent);
+    #####:  839:        free(cl);
+        -:  840:    }
+        1:  841:    fclose(fo);
+call    0 returned 1
+        -:  842:}
+        -:  843:
+function ArgPos called 17 returned 100% blocks executed 75%
+       17:  844:int ArgPos(char *str, int argc, char **argv) {
+        -:  845:    int a;
+      259:  846:    for (a = 1; a < argc; a++) if (!strcmp(str, argv[a])) {
+branch  0 taken 11 (fallthrough)
+branch  1 taken 242
+branch  2 taken 253
+branch  3 taken 6 (fallthrough)
+       11:  847:        if (a == argc - 1) {
+branch  0 taken 0 (fallthrough)
+branch  1 taken 11
+        -:  848:        printf("Argument missing for %s\n", str);
+    #####:  849:        exit(1);
+call    0 never executed
+        -:  850:        }
+        -:  851:        return a;
+        -:  852:    }
+        -:  853:    return -1;
+        -:  854:}
+        -:  855:
+function main called 1 returned 100% blocks executed 54%
+        1:  856:int main(int argc, char **argv) {
+        -:  857:  int i;
+        1:  858:  if (argc == 1) {
+branch  0 taken 0 (fallthrough)
+branch  1 taken 1
+        -:  859:    printf("WORD VECTOR estimation toolkit v 0.1c\n\n");
+        -:  860:    printf("Options:\n");
+        -:  861:    printf("Parameters for training:\n");
+        -:  862:    printf("\t-train <file>\n");
+        -:  863:    printf("\t\tUse text data from <file> to train the model\n");
+        -:  864:    printf("\t-output <file>\n");
+        -:  865:    printf("\t\tUse <file> to save the resulting word vectors / word clusters\n");
+        -:  866:    printf("\t-size <int>\n");
+        -:  867:    printf("\t\tSet size of word vectors; default is 100\n");
+        -:  868:    printf("\t-window <int>\n");
+        -:  869:    printf("\t\tSet max skip length between words; default is 5\n");
+        -:  870:    printf("\t-sample <float>\n");
+        -:  871:    printf("\t\tSet threshold for occurrence of words. Those that appear with higher frequency in the training data\n");
+        -:  872:    printf("\t\twill be randomly down-sampled; default is 1e-3, useful range is (0, 1e-5)\n");
+        -:  873:    printf("\t-hs <int>\n");
+        -:  874:    printf("\t\tUse Hierarchical Softmax; default is 0 (not used)\n");
+        -:  875:    printf("\t-negative <int>\n");
+        -:  876:    printf("\t\tNumber of negative examples; default is 5, common values are 3 - 10 (0 = not used)\n");
+        -:  877:    printf("\t-threads <int>\n");
+        -:  878:    printf("\t\tUse <int> threads (default 12)\n");
+        -:  879:    printf("\t-iter <int>\n");
+        -:  880:    printf("\t\tRun more training iterations (default 5)\n");
+        -:  881:    printf("\t-min-count <int>\n");
+        -:  882:    printf("\t\tThis will discard words that appear less than <int> times; default is 5\n");
+        -:  883:    printf("\t-alpha <float>\n");
+        -:  884:    printf("\t\tSet the starting learning rate; default is 0.025 for skip-gram and 0.05 for CBOW\n");
+        -:  885:    printf("\t-classes <int>\n");
+        -:  886:    printf("\t\tOutput word classes rather than word vectors; default number of classes is 0 (vectors are written)\n");
+        -:  887:    printf("\t-debug <int>\n");
+        -:  888:    printf("\t\tSet the debug mode (default = 2 = more info during training)\n");
+        -:  889:    printf("\t-binary <int>\n");
+        -:  890:    printf("\t\tSave the resulting vectors in binary moded; default is 0 (off)\n");
+        -:  891:    printf("\t-save-vocab <file>\n");
+        -:  892:    printf("\t\tThe vocabulary will be saved to <file>\n");
+        -:  893:    printf("\t-read-vocab <file>\n");
+        -:  894:    printf("\t\tThe vocabulary will be read from <file>, not constructed from the training data\n");
+        -:  895:    printf("\t-cbow <int>\n");
+        -:  896:    printf("\t\tUse the continuous bag of words model; default is 1 (use 0 for skip-gram model)\n");
+        -:  897:    printf("\nExamples:\n");
+        -:  898:    printf("./word2vec -train data.txt -output vec.txt -size 200 -window 5 -sample 1e-4 -negative 5 -hs 0 -binary 0 -cbow 1 -iter 3\n\n");
+    #####:  899:    return 0;
+        -:  900:  }
+        1:  901:  output_file[0] = 0;
+        1:  902:  save_vocab_file[0] = 0;
+        1:  903:  read_vocab_file[0] = 0;
+        1:  904:  if ((i = ArgPos((char *)"-size", argc, argv)) > 0) layer1_size = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+call    3 returned 1
+        1:  905:  if ((i = ArgPos((char *)"-train", argc, argv)) > 0) strcpy(train_file, argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+       1*:  906:  if ((i = ArgPos((char *)"-save-vocab", argc, argv)) > 0) strcpy(save_vocab_file, argv[i + 1]);
+call    0 returned 1
+branch  1 taken 0 (fallthrough)
+branch  2 taken 1
+       1*:  907:  if ((i = ArgPos((char *)"-read-vocab", argc, argv)) > 0) strcpy(read_vocab_file, argv[i + 1]);
+call    0 returned 1
+branch  1 taken 0 (fallthrough)
+branch  2 taken 1
+       1*:  908:  if ((i = ArgPos((char *)"-debug", argc, argv)) > 0) debug_mode = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 0 (fallthrough)
+branch  2 taken 1
+call    3 never executed
+        1:  909:  if ((i = ArgPos((char *)"-binary", argc, argv)) > 0) binary = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+call    3 returned 1
+        1:  910:  if ((i = ArgPos((char *)"-cbow", argc, argv)) > 0) cbow = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+call    3 returned 1
+       1*:  911:  if (cbow) alpha = 0.05;
+branch  0 taken 0 (fallthrough)
+branch  1 taken 1
+       1*:  912:  if ((i = ArgPos((char *)"-alpha", argc, argv)) > 0) alpha = atof(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 0 (fallthrough)
+branch  2 taken 1
+call    3 never executed
+        1:  913:  if ((i = ArgPos((char *)"-output", argc, argv)) > 0) strcpy(output_file, argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+        1:  914:  if ((i = ArgPos((char *)"-window", argc, argv)) > 0) window = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+call    3 returned 1
+        1:  915:  if ((i = ArgPos((char *)"-sample", argc, argv)) > 0) sample = atof(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+call    3 returned 1
+        1:  916:  if ((i = ArgPos((char *)"-hs", argc, argv)) > 0) hs = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+call    3 returned 1
+        1:  917:  if ((i = ArgPos((char *)"-negative", argc, argv)) > 0) negative = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+call    3 returned 1
+        1:  918:  if ((i = ArgPos((char *)"-threads", argc, argv)) > 0) num_threads = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+call    3 returned 1
+        1:  919:  if ((i = ArgPos((char *)"-iter", argc, argv)) > 0) iter = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 1 (fallthrough)
+branch  2 taken 0
+call    3 returned 1
+       1*:  920:  if ((i = ArgPos((char *)"-min-count", argc, argv)) > 0) min_count = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 0 (fallthrough)
+branch  2 taken 1
+call    3 never executed
+       1*:  921:  if ((i = ArgPos((char *)"-classes", argc, argv)) > 0) classes = atoi(argv[i + 1]);
+call    0 returned 1
+branch  1 taken 0 (fallthrough)
+branch  2 taken 1
+call    3 never executed
+        1:  922:  vocab = (struct vocab_word *)calloc(vocab_max_size, sizeof(struct vocab_word));
+        1:  923:  vocab_hash = (int *)calloc(vocab_hash_size, sizeof(int));
+        -:  924:  // precompute e^x / (e^x + 1) for x in [-MAX_EXP, MAX_EXP)
+        -:  925:  // TODO extra element (+ 1) seems unused?
+        1:  926:  expTable = (real *)malloc((EXP_TABLE_SIZE + 1) * sizeof(real));
+     1001:  927:  for (i = 0; i < EXP_TABLE_SIZE; i++) {
+branch  0 taken 1000
+branch  1 taken 1 (fallthrough)
+        -:  928:    // Precompute the exp() table
+     1000:  929:    expTable[i] = exp((i / (real)EXP_TABLE_SIZE * 2 - 1) * MAX_EXP);
+        -:  930:    // Precompute f(x) = x / (x + 1)
+     1000:  931:    expTable[i] = expTable[i] / (expTable[i] + 1);
+        -:  932:  }
+        1:  933:  TrainModel();
+call    0 returned 1
+        1:  934:  return 0;
+        -:  935:}

@@ -1,4 +1,4 @@
-CC = gcc-12
+CC = gcc
 CFLAGS = -lm -Ofast -march=native -funroll-loops
 
 all: word2vec distance
